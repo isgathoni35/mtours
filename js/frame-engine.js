@@ -1,51 +1,67 @@
 /**
  * ============================================================================
- * M TOURS — HIGH PERFORMANCE SCROLL FRAME ENGINE (60 FPS LERP)
+ * M TOURS — HIGH PERFORMANCE SCROLL FRAME ENGINE v2 (60 FPS, NETWORK-OPTIMISED)
  * ============================================================================
- * Synchronizes 876 background video frames seamlessly with page scroll,
- * featuring tiered preloading, double-buffered canvas rendering, and
- * active section anchor tracking.
+ * Synchronizes 876 background video frames seamlessly with page scroll.
+ *
+ * Strategy (network-first design for Vercel CDN):
+ *  1. Frame 0 loaded first  → hero paints immediately.
+ *  2. Sparse keyframe pass  → every 10th frame (88 images) → full 0-100%
+ *     scrub is serviceable within ~2-3s on average broadband.
+ *  3. JIT neighborhood fill → ±12-frame window around the current scrub
+ *     point stays hot, so neighbours are decoded BEFORE the user reaches them.
+ *  4. Idle background fill  → remaining ~785 frames stream in 4-at-a-time
+ *     batches with a 16ms yield to avoid saturating network sockets.
+ *
+ * Decoding: every image goes through `await img.decode()` BEFORE being placed
+ * in the cache. This offloads JPEG decompression to background threads and
+ * guarantees ctx.drawImage() never blocks the main thread.
+ * ============================================================================
  */
 
 class SinglePageFrameEngine {
   constructor(options = {}) {
-    this.totalFrames = options.totalFrames || 876;
-    this.framePrefix = options.framePrefix || 'tourism/frame_';
-    this.frameExt = options.frameExt || '.jpg';
-    this.canvas = document.getElementById('bg-canvas');
-    this.ctx = this.canvas ? this.canvas.getContext('2d', { alpha: false }) : null;
+    this.totalFrames   = options.totalFrames  || 876;
+    this.framePrefix   = options.framePrefix  || 'tourism/frame_';
+    this.frameExt      = options.frameExt     || '.jpg';
+    this.canvas        = document.getElementById('bg-canvas');
+    this.ctx           = this.canvas
+                           ? this.canvas.getContext('2d', { alpha: false })
+                           : null;
 
-    // Cache & loading state
-    this.cache = new Array(this.totalFrames).fill(null);
-    this.loadedStatus = new Uint8Array(this.totalFrames); // 0=unrequested, 1=loading, 2=loaded
-    this.loadedCount = 0;
+    // Cache & status tracking
+    this.cache   = new Array(this.totalFrames).fill(null);
+    // 0 = untouched, 1 = in-flight, 2 = decoded & ready
+    this.status  = new Uint8Array(this.totalFrames);
+    // Deduplication: prevents two fetches launching for the same frame
+    this.inFlight = new Set();
 
-    // Scrub interpolation state
-    this.targetProgress = 0;
+    // Lerp scrub state
+    this.targetProgress  = 0;
     this.currentProgress = 0;
-    this.lerpFactor = 0.12; // Smooth Apple-style momentum damping
-    this.lastDrawnFrame = -1;
+    this.lerpFactor      = 0.10; // Apple-style momentum damping
+    this.lastDrawnFrame  = -1;
 
-    // Section anchor tracking
+    // Section + nav tracking
     this.sections = document.querySelectorAll('main > section');
     this.navLinks = document.querySelectorAll('.site-nav .nav-link');
 
     this.init();
   }
 
+  // ---------------------------------------------------------------------------
   getFrameUrl(index) {
     const padded = String(index).padStart(6, '0');
     return `${this.framePrefix}${padded}${this.frameExt}`;
   }
 
+  // ---------------------------------------------------------------------------
   init() {
     if (!this.canvas || !this.ctx) return;
 
-    // Handle high-DPI canvas resizing
     this.resizeCanvas();
     window.addEventListener('resize', () => this.resizeCanvas(), { passive: true });
 
-    // Scroll listeners & initial position alignment
     window.addEventListener('scroll', () => {
       this.onScroll();
       this.updateActiveNav();
@@ -54,26 +70,20 @@ class SinglePageFrameEngine {
     this.onScroll();
     this.currentProgress = this.targetProgress;
 
-    // Start RAF rendering loop
     this.startRenderLoop();
-
-    // Start Stratified Preloader Pipeline
     this.startPreloadPipeline();
-
-    // Header background change on scroll
     this.bindHeaderScroll();
-
-    // Smooth anchor navigation
     this.bindAnchorClicks();
   }
 
+  // ---------------------------------------------------------------------------
   resizeCanvas() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const width = window.innerWidth;
+    const dpr    = Math.min(window.devicePixelRatio || 1, 2);
+    const width  = window.innerWidth;
     const height = window.innerHeight;
 
     if (this.canvas.width !== width * dpr || this.canvas.height !== height * dpr) {
-      this.canvas.width = width * dpr;
+      this.canvas.width  = width  * dpr;
       this.canvas.height = height * dpr;
       this.ctx.imageSmoothingEnabled = true;
       this.ctx.imageSmoothingQuality = 'high';
@@ -84,102 +94,132 @@ class SinglePageFrameEngine {
     }
   }
 
-  // =========================================================================
-  // STRATIFIED PRELOAD PIPELINE
-  // =========================================================================
-  async startPreloadPipeline() {
-    // 1. Immediately load frame 0 for instant hero visual
-    await this.loadSingleFrame(0);
-    this.renderFrame(0);
+  // ===========================================================================
+  // CORE LOADER — off-thread async decode via img.decode()
+  // ===========================================================================
 
-    // 2. Preload Keyframe skeleton across the whole 876 frames (every 6th frame ~ 146 images)
-    // Takes only ~1.5s on broadband / local, guarantees 0-100% scrub availability immediately!
-    const keyframes = [];
-    for (let i = 0; i < this.totalFrames; i += 6) {
-      if (i !== 0) keyframes.push(i);
-    }
-    keyframes.push(this.totalFrames - 1);
-
-    const batchSize = 8;
-    for (let i = 0; i < keyframes.length; i += batchSize) {
-      const slice = keyframes.slice(i, i + batchSize);
-      await Promise.all(slice.map(idx => this.loadSingleFrame(idx)));
-    }
-
-    // 3. Fill remaining frames in background idle batches
-    this.queueRemainingFrames();
-  }
-
-  loadSingleFrame(index) {
+  loadFrame(index) {
     if (index < 0 || index >= this.totalFrames) return Promise.resolve(null);
-    if (this.loadedStatus[index] === 2) return Promise.resolve(this.cache[index]);
-    if (this.loadedStatus[index] === 1) {
+    if (this.status[index] === 2)               return Promise.resolve(this.cache[index]);
+
+    // Return a waiting promise if already in-flight
+    if (this.inFlight.has(index)) {
       return new Promise(resolve => {
-        const check = setInterval(() => {
-          if (this.loadedStatus[index] === 2) {
-            clearInterval(check);
+        const poll = setInterval(() => {
+          if (this.status[index] === 2) {
+            clearInterval(poll);
             resolve(this.cache[index]);
           }
-        }, 30);
+        }, 20);
       });
     }
 
-    this.loadedStatus[index] = 1;
-    return new Promise(resolve => {
-      const img = new Image();
-      img.decoding = 'async';
-      img.onload = () => {
-        this.cache[index] = img;
-        this.loadedStatus[index] = 2;
-        this.loadedCount++;
-        resolve(img);
-      };
-      img.onerror = () => {
-        this.loadedStatus[index] = 0;
-        resolve(null);
-      };
-      img.src = this.getFrameUrl(index);
-    });
+    this.status[index] = 1;
+    this.inFlight.add(index);
+
+    const img = new Image();
+    img.decoding = 'async';
+    img.src = this.getFrameUrl(index);
+
+    return img.decode()
+      .then(() => {
+        this.cache[index]  = img;
+        this.status[index] = 2;
+        this.inFlight.delete(index);
+        return img;
+      })
+      .catch(() => {
+        // Fallback for browsers that don't fully support img.decode()
+        return new Promise(resolve => {
+          img.onload = () => {
+            this.cache[index]  = img;
+            this.status[index] = 2;
+            this.inFlight.delete(index);
+            resolve(img);
+          };
+          img.onerror = () => {
+            this.status[index] = 0;
+            this.inFlight.delete(index);
+            resolve(null);
+          };
+        });
+      });
   }
 
-  async queueRemainingFrames() {
+  // ===========================================================================
+  // STRATIFIED PRELOAD PIPELINE
+  // ===========================================================================
+
+  async startPreloadPipeline() {
+    // Phase 1 — Frame 0 for instant hero render
+    await this.loadFrame(0);
+    this.renderFrame(0);
+
+    // Phase 2 — Sparse keyframes: every 10th frame = 88 images
+    // Gives serviceable full-range scrub within ~2-3s on broadband.
+    const keyframes = [];
+    for (let i = 10; i < this.totalFrames; i += 10) {
+      keyframes.push(i);
+    }
+    keyframes.push(this.totalFrames - 1); // last frame always ready
+
+    const BATCH = 6;
+    for (let i = 0; i < keyframes.length; i += BATCH) {
+      const slice = keyframes.slice(i, i + BATCH);
+      await Promise.all(slice.map(idx => this.loadFrame(idx)));
+    }
+
+    // Phase 3 — Background idle fill (remaining ~785 frames)
+    this.fillRemainingFrames();
+  }
+
+  async fillRemainingFrames() {
     const missing = [];
     for (let i = 0; i < this.totalFrames; i++) {
-      if (this.loadedStatus[i] === 0) missing.push(i);
+      if (this.status[i] === 0) missing.push(i);
     }
 
-    const batchSize = 6;
-    for (let i = 0; i < missing.length; i += batchSize) {
-      await new Promise(r => setTimeout(r, 16));
-      const slice = missing.slice(i, i + batchSize);
-      await Promise.all(slice.map(idx => this.loadSingleFrame(idx)));
+    const BATCH = 4;
+    for (let i = 0; i < missing.length; i += BATCH) {
+      await new Promise(r => setTimeout(r, 16)); // yield between batches
+      const slice = missing.slice(i, i + BATCH);
+      await Promise.all(slice.map(idx => this.loadFrame(idx)));
     }
   }
 
-  // =========================================================================
-  // SCROLL PROGRESS & MOMENTUM LERP LOOP
-  // =========================================================================
+  // ===========================================================================
+  // JIT NEIGHBORHOOD FILL (called every RAF tick)
+  // ===========================================================================
+
+  primeNeighborhood(centerIdx) {
+    for (let offset = -12; offset <= 12; offset++) {
+      const idx = centerIdx + offset;
+      if (idx >= 0 && idx < this.totalFrames && this.status[idx] === 0) {
+        this.loadFrame(idx); // fire-and-forget
+      }
+    }
+  }
+
+  // ===========================================================================
+  // SCROLL & RENDER LOOP
+  // ===========================================================================
+
   onScroll() {
     const maxScroll = (document.documentElement.scrollHeight - window.innerHeight) || 1;
-    const progress = Math.max(0, Math.min(1, window.scrollY / maxScroll));
-    this.targetProgress = progress;
+    this.targetProgress = Math.max(0, Math.min(1, window.scrollY / maxScroll));
   }
 
   startRenderLoop() {
     const loop = () => {
-      // Smooth lerp calculation
       this.currentProgress += (this.targetProgress - this.currentProgress) * this.lerpFactor;
 
-      // Map progress directly to frame index (0 to 875)
       const targetFrame = Math.max(0, Math.min(
         this.totalFrames - 1,
         Math.round(this.currentProgress * (this.totalFrames - 1))
       ));
 
-      // Prioritize neighbor frames around current scrub point
-      this.ensureNeighborFrames(targetFrame);
+      this.primeNeighborhood(targetFrame);
 
-      // Draw only if frame changed
       if (targetFrame !== this.lastDrawnFrame) {
         this.renderFrame(targetFrame);
       }
@@ -190,22 +230,16 @@ class SinglePageFrameEngine {
     requestAnimationFrame(loop);
   }
 
-  ensureNeighborFrames(centerIdx) {
-    for (let offset = -12; offset <= 12; offset++) {
-      const idx = centerIdx + offset;
-      if (idx >= 0 && idx < this.totalFrames && this.loadedStatus[idx] === 0) {
-        this.loadSingleFrame(idx);
-      }
-    }
-  }
+  // ===========================================================================
+  // RENDER (aspect-ratio cover)
+  // ===========================================================================
 
   getBestFrame(index) {
     if (this.cache[index]) return this.cache[index];
 
-    // Fallback to closest loaded keyframe so canvas never flickers or goes blank
-    for (let r = 1; r < 30; r++) {
-      if (index - r >= 0 && this.cache[index - r]) return this.cache[index - r];
-      if (index + r < this.totalFrames && this.cache[index + r]) return this.cache[index + r];
+    for (let r = 1; r < 40; r++) {
+      if (index - r >= 0                && this.cache[index - r]) return this.cache[index - r];
+      if (index + r < this.totalFrames  && this.cache[index + r]) return this.cache[index + r];
     }
     return null;
   }
@@ -216,10 +250,9 @@ class SinglePageFrameEngine {
 
     const cw = this.canvas.width;
     const ch = this.canvas.height;
-    const iw = img.naturalWidth || 1280;
+    const iw = img.naturalWidth  || 1280;
     const ih = img.naturalHeight || 720;
 
-    // Aspect-ratio cover math: perfectly centers and scales to fill screen
     const scale = Math.max(cw / iw, ch / ih);
     const sw = iw * scale;
     const sh = ih * scale;
@@ -230,41 +263,34 @@ class SinglePageFrameEngine {
     this.lastDrawnFrame = frameIndex;
   }
 
-  // =========================================================================
-  // ACTIVE NAVIGATION & ANCHOR SCROLLING
-  // =========================================================================
+  // ===========================================================================
+  // NAV + ANCHOR HELPERS
+  // ===========================================================================
+
   updateActiveNav() {
     const scrollPos = window.scrollY + window.innerHeight * 0.35;
     let currentId = '';
 
     this.sections.forEach(sec => {
-      const top = sec.offsetTop;
-      const height = sec.offsetHeight;
-      if (scrollPos >= top && scrollPos < top + height) {
+      if (scrollPos >= sec.offsetTop && scrollPos < sec.offsetTop + sec.offsetHeight) {
         currentId = sec.getAttribute('id');
       }
     });
 
     this.navLinks.forEach(link => {
-      const href = link.getAttribute('href');
-      if (href === `#${currentId}`) {
-        link.classList.add('active');
-      } else {
-        link.classList.remove('active');
-      }
+      link.classList.toggle('active', link.getAttribute('href') === `#${currentId}`);
     });
   }
 
   bindAnchorClicks() {
     document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-      anchor.addEventListener('click', (e) => {
+      anchor.addEventListener('click', e => {
         const targetId = anchor.getAttribute('href');
-        if (targetId === '#' || targetId === '') return;
-        const targetEl = document.querySelector(targetId);
-        if (!targetEl) return;
-
+        if (!targetId || targetId === '#') return;
+        const el = document.querySelector(targetId);
+        if (!el) return;
         e.preventDefault();
-        targetEl.scrollIntoView({ behavior: 'smooth' });
+        el.scrollIntoView({ behavior: 'smooth' });
       });
     });
   }
@@ -272,17 +298,13 @@ class SinglePageFrameEngine {
   bindHeaderScroll() {
     const header = document.querySelector('.site-header');
     if (!header) return;
-
     window.addEventListener('scroll', () => {
-      if (window.scrollY > 40) {
-        header.classList.add('scrolled');
-      } else {
-        header.classList.remove('scrolled');
-      }
+      header.classList.toggle('scrolled', window.scrollY > 40);
     }, { passive: true });
   }
 }
 
+// ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
   window.frameEngine = new SinglePageFrameEngine();
 });
